@@ -431,6 +431,15 @@ function App() {
   async function startCamera() {
     setError("");
 
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraStatus("blocked");
+      setAutoCapturePending(false);
+      setError(
+        "Camera access requires HTTPS on public deployments. Open the app over HTTPS or test from localhost.",
+      );
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {

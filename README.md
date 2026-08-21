@@ -525,6 +525,30 @@ Without Nginx:
 curl http://<ec2-public-ip>:8001/api/health
 ```
 
+For deployed camera access, use HTTPS. Browsers block camera capture on public plain HTTP URLs. Point a domain DNS `A` record to the EC2 public IP, then use the Caddy HTTPS override:
+
+```env
+APP_DOMAIN=<your-domain>
+PUBLIC_BIND_HOST=127.0.0.1
+VITE_API_BASE_URL=
+API_GATEWAY_CORS_ORIGINS=https://<your-domain>
+AUTH_SERVICE_CORS_ORIGINS=https://<your-domain>
+EMOTION_API_CORS_ORIGINS=https://<your-domain>
+RECOMMENDATION_SERVICE_CORS_ORIGINS=https://<your-domain>
+```
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml -f docker-compose.https.yml up --build -d
+```
+
+Verify HTTPS:
+
+```bash
+curl -I https://<your-domain>
+curl -I https://<your-domain>/api/health
+docker logs --tail=100 emotion-music-ai-caddy
+```
+
 These direct ports should fail from outside the EC2 security group:
 
 ```text
