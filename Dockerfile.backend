@@ -10,9 +10,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+ARG REQUIREMENTS_FILE=requirements.web.txt
+COPY requirements.txt requirements.web.txt ./
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt
+    && python -m pip install -r ${REQUIREMENTS_FILE}
 
 COPY . .
 

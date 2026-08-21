@@ -1,6 +1,14 @@
-x-backend-build: &backend-build
+x-backend-web-build: &backend-web-build
   context: .
   dockerfile: Dockerfile.backend
+  args:
+    REQUIREMENTS_FILE: requirements.web.txt
+
+x-backend-emotion-build: &backend-emotion-build
+  context: .
+  dockerfile: Dockerfile.backend
+  args:
+    REQUIREMENTS_FILE: requirements.txt
 
 x-backend-env: &backend-env
   env_file:
@@ -25,7 +33,8 @@ services:
 
   emotion_api:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-emotion-api:latest
+    build: *backend-emotion-build
     container_name: emotion-music-ai-emotion-api
     command: ["python", "-m", "uvicorn", "services.emotion_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     expose:
@@ -38,7 +47,8 @@ services:
 
   auth:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-auth
     command: ["python", "-m", "uvicorn", "services.auth.main:app", "--host", "0.0.0.0", "--port", "8002"]
     expose:
@@ -46,7 +56,8 @@ services:
 
   recommendation:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-recommendation
     command: ["python", "-m", "uvicorn", "services.recommendation.main:app", "--host", "0.0.0.0", "--port", "8004"]
     environment:
@@ -59,7 +70,8 @@ services:
 
   analytics:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-analytics
     command: ["python", "-m", "uvicorn", "services.analytics.main:app", "--host", "0.0.0.0", "--port", "8005"]
     expose:
@@ -67,7 +79,8 @@ services:
 
   api_gateway:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-api-gateway
     command: ["python", "-m", "uvicorn", "services.api_gateway.main:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
@@ -92,7 +105,8 @@ services:
 
   recommendation_consumer:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-recommendation-consumer
     command: ["python", "-m", "services.recommendation.consumer"]
     environment:
@@ -103,7 +117,8 @@ services:
 
   analytics_consumer:
     <<: *backend-env
-    build: *backend-build
+    image: emotion-music-ai-backend-web:latest
+    build: *backend-web-build
     container_name: emotion-music-ai-analytics-consumer
     command: ["python", "-m", "services.analytics.consumer"]
 
