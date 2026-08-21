@@ -90,7 +90,7 @@ services:
       ANALYTICS_SERVICE_BASE_URL: http://analytics:8005
       REDIS_URL: redis://redis:6379/0
     ports:
-      - "127.0.0.1:8001:8001"
+      - "${PUBLIC_BIND_HOST:-127.0.0.1}:8001:8001"
     depends_on:
       redis:
         condition: service_healthy
@@ -127,10 +127,10 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
-        VITE_API_BASE_URL: ""
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
     container_name: emotion-music-ai-frontend
     ports:
-      - "127.0.0.1:5173:80"
+      - "${PUBLIC_BIND_HOST:-127.0.0.1}:5173:80"
     restart: unless-stopped
     depends_on:
       api_gateway:
