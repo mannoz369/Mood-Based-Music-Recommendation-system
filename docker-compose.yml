@@ -4,7 +4,7 @@ services:
     container_name: emotion-music-ai-redis
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -13,17 +13,78 @@ services:
       timeout: 5s
       retries: 5
 
+  mongodb:
+    image: mongo:7
+    container_name: emotion-music-ai-mongodb
+    profiles: ["local-mongo"]
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: emotion_music_ai
+      MONGO_INITDB_ROOT_PASSWORD: emotion_music_ai_dev
+      MONGO_INITDB_DATABASE: emotion_music_ai
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda:
+    image: redpandadata/redpanda:v24.3.7
+    container_name: emotion-music-ai-redpanda
+    profiles: ["local-kafka"]
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,DOCKER://0.0.0.0:29092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:9092,DOCKER://redpanda:29092
+    ports:
+      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   redisinsight:
     image: redis/redisinsight:latest
     container_name: emotion-music-ai-redisinsight
+    profiles: ["tools"]
     ports:
-      - "5540:5540"
+      - "127.0.0.1:5540:5540"
     volumes:
       - redisinsight-data:/data
     depends_on:
       redis:
         condition: service_healthy
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: emotion-music-ai-kafka-ui
+    profiles: ["tools", "local-kafka"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: emotion-music-ai
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: redpanda:29092
+    ports:
+      - "127.0.0.1:8086:8080"
+
 volumes:
   redis-data:
+  mongodb-data:
+  redpanda-data:
   redisinsight-data:

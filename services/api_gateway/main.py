@@ -8,7 +8,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from config import get_api_gateway_settings
+from config import get_api_gateway_settings, get_event_settings
+from services.events import EventEnvelope, create_event_producer
 from services.recommendation.cache import RecommendationCache
 
 
@@ -43,6 +44,11 @@ def get_rate_limit_cache():
         namespace=gateway_settings.redis_namespace,
         fail_open=gateway_settings.redis_fail_open,
     )
+
+
+@lru_cache(maxsize=1)
+def get_event_producer():
+    return create_event_producer(get_event_settings())
 
 
 @app.middleware("http")
@@ -111,6 +117,10 @@ def _auth_url(path):
 
 def _recommendation_url(path):
     return f"{get_api_gateway_settings().recommendation_service_base_url}/{path.lstrip('/')}"
+
+
+def _analytics_url(path):
+    return f"{get_api_gateway_settings().analytics_service_base_url}/{path.lstrip('/')}"
 
 
 def _with_query(url, request):
@@ -314,6 +324,45 @@ def _url_with_trusted_user_id(url, user_id):
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query_items), parts.fragment))
 
 
+def _correlation_id(request):
+    return (
+        request.headers.get("x-correlation-id")
+        or request.headers.get("x-request-id")
+    )
+
+
+async def _publish_gateway_event(request, event_type, user, payload):
+    try:
+        await get_event_producer().publish(
+            EventEnvelope(
+                event_type=event_type,
+                source_service=get_api_gateway_settings().service_name,
+                user_id=user["id"] if user else None,
+                correlation_id=_correlation_id(request),
+                payload=payload,
+            )
+        )
+    except Exception:
+        if not get_event_settings().kafka_fail_open:
+            raise
+
+
+def _emotion_detected_payload(response):
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    return {
+        "emotion": payload.get("emotion"),
+        "confidence": payload.get("confidence"),
+        "face": payload.get("face"),
+    }
+
+
 @app.get("/api/health")
 async def health():
     gateway_settings = get_api_gateway_settings()
@@ -416,12 +465,46 @@ async def health():
             **recommendation_payload,
         }
 
+    try:
+        analytics_response = await request_downstream(
+            "GET",
+            _analytics_url("/health"),
+            headers={"accept": "application/json"},
+        )
+    except httpx.HTTPError as exc:
+        status_value = "degraded"
+        analytics_health = {
+            "status": "unavailable",
+            "base_url": gateway_settings.analytics_service_base_url,
+            "detail": str(exc),
+        }
+    else:
+        analytics_payload = {}
+
+        try:
+            analytics_payload = analytics_response.json()
+        except ValueError:
+            analytics_payload = {"detail": analytics_response.text}
+
+        if (
+            not analytics_response.is_success
+            or analytics_payload.get("status") != "ok"
+        ):
+            status_value = "degraded"
+
+        analytics_health = {
+            "status_code": analytics_response.status_code,
+            "base_url": gateway_settings.analytics_service_base_url,
+            **analytics_payload,
+        }
+
     return {
         "status": status_value,
         "service": gateway_settings.service_name,
         "emotion_api": emotion_health,
         "auth_service": auth_health,
         "recommendation_service": recommendation_health,
+        "analytics_service": analytics_health,
         "rate_limiter": rate_limiter_health,
     }
 
@@ -435,6 +518,18 @@ async def proxy_emotion(path: str, request: Request):
 
     method = request.method
     body = await request.body()
+    is_detection_request = method.upper() == "POST" and path == "detect"
+
+    if is_detection_request:
+        await _publish_gateway_event(
+            request,
+            "camera.capture",
+            user,
+            {
+                "route": "/api/emotion/detect",
+                "content_type": request.headers.get("content-type"),
+            },
+        )
 
     try:
         downstream_response = await request_downstream(
@@ -448,6 +543,17 @@ async def proxy_emotion(path: str, request: Request):
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=_downstream_error_detail("Emotion API", exc),
         ) from exc
+
+    if is_detection_request and downstream_response.is_success:
+        payload = _emotion_detected_payload(downstream_response)
+
+        if payload:
+            await _publish_gateway_event(
+                request,
+                "emotion.detected",
+                user,
+                payload,
+            )
 
     return _gateway_response(downstream_response)
 
@@ -512,6 +618,28 @@ async def proxy_playback_event(request: Request):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=_downstream_error_detail("Recommendation service", exc),
+        ) from exc
+
+    return _gateway_response(downstream_response)
+
+
+@app.api_route("/api/analytics/{path:path}", methods=["GET"])
+async def proxy_analytics(path: str, request: Request):
+    user = await _resolve_gateway_user(request)
+
+    if _is_gateway_response(user):
+        return user
+
+    try:
+        downstream_response = await request_downstream(
+            request.method,
+            _with_query(_analytics_url(f"/analytics/{path}"), request),
+            headers=_forward_headers_with_user(request, user),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=_downstream_error_detail("Analytics service", exc),
         ) from exc
 
     return _gateway_response(downstream_response)

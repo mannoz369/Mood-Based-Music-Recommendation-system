@@ -3,9 +3,10 @@ from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
-from config import get_recommendation_settings
+from config import get_event_settings, get_recommendation_settings
 from services.recommendation import main
 from services.recommendation.cache import RecommendationCache
+from services.recommendation.consumer import RecommendationEventConsumer
 from services.recommendation.intents import get_profile_variants_for_emotion
 from services.recommendation.service import RecommendationService
 from services.recommendation.jamendo_client import JamendoClient, JamendoError
@@ -93,6 +94,15 @@ class FakeRedis:
         values = self.lists.get(key, [])
         end = None if stop == -1 else stop + 1
         return values[start:end]
+
+
+class FakeEventProducer:
+    def __init__(self):
+        self.published = []
+
+    async def publish(self, event, topic=None):
+        self.published.append(event.to_dict())
+        return {"event": event.to_dict(), "topic": topic, "published": True}
 
 
 def _settings():
@@ -306,6 +316,51 @@ def test_recommendation_service_writes_operational_cache_state():
     asyncio.run(run())
 
 
+def test_recommendation_service_publishes_requested_and_served_events():
+    async def run():
+        producer = FakeEventProducer()
+        service = RecommendationService(
+            FakeJamendoClient(),
+            _settings(),
+            event_producer=producer,
+        )
+
+        response = await service.from_emotion(
+            "Happy",
+            limit=2,
+            user_id="User 1",
+            language="en",
+            request_seed="event-seed",
+        )
+
+        return response, producer.published
+
+    response, events = asyncio.run(run())
+
+    assert [event["event_type"] for event in events] == [
+        "recommendation.requested",
+        "recommendation.served",
+    ]
+    requested = events[0]
+    served = events[1]
+    assert requested["source_service"] == "recommendation-service"
+    assert requested["user_id"] == "User 1"
+    assert requested["payload"] == {
+        "emotion": "Happy",
+        "limit": 2,
+        "language": "en",
+        "request_seed": "event-seed",
+        "recent_recommended_track_count": 0,
+        "recent_played_track_count": 0,
+    }
+    assert served["payload"]["emotion"] == "Happy"
+    assert served["payload"]["language"] == "en"
+    assert served["payload"]["query"] == response["query"]
+    assert served["payload"]["dynamic_profile"] == response["dynamic_profile"]
+    assert served["payload"]["track_ids"] == ["track-1", "track-2"]
+    assert served["payload"]["cache"]["hit"] is False
+
+
 def test_current_emotion_returns_cached_user_mood():
     async def run():
         redis = FakeRedis()
@@ -362,6 +417,161 @@ def test_playback_event_updates_recent_played_track_memory():
         assert await cache.get_recent_track_ids("User 1", kind="played") == ["track-123"]
 
     asyncio.run(run())
+
+
+def test_playback_event_publishes_kafka_event():
+    async def run():
+        redis = FakeRedis()
+        cache = RecommendationCache("redis://test", namespace="test")
+        cache._redis = redis
+        producer = FakeEventProducer()
+        service = RecommendationService(
+            FakeJamendoClient(),
+            _settings(),
+            cache=cache,
+            event_producer=producer,
+        )
+
+        response = await service.record_playback_event(
+            "ended",
+            "track-123",
+            user_id="User 1",
+            emotion="Happy",
+            provider="jamendo",
+        )
+
+        return response, await cache.get_recent_track_ids("User 1", kind="played"), producer.published
+
+    response, recent_played, events = asyncio.run(run())
+
+    assert response["status"] == "ok"
+    assert recent_played == ["track-123"]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "playback.event"
+    assert events[0]["user_id"] == "User 1"
+    assert events[0]["payload"] == {
+        "event_type": "ended",
+        "track_id": "track-123",
+        "emotion": "Happy",
+        "provider": "jamendo",
+    }
+
+
+def test_emotion_detected_event_precomputes_recommendations_and_publishes_generated():
+    async def run():
+        redis = FakeRedis()
+        cache = RecommendationCache("redis://test", namespace="test")
+        cache._redis = redis
+        producer = FakeEventProducer()
+        music_client = FakeJamendoClient()
+        service = RecommendationService(
+            music_client,
+            _settings(),
+            cache=cache,
+            event_producer=producer,
+        )
+
+        result = await service.handle_emotion_detected_event(
+            {
+                "event_id": "emotion-event-1",
+                "event_type": "emotion.detected",
+                "user_id": "User 1",
+                "correlation_id": "capture-1",
+                "payload": {"emotion": "Happy", "language": "en", "limit": 2},
+            }
+        )
+
+        generated = producer.published[-1]
+        cache_key = generated["payload"]["cache"]["key"]
+        cached_payload = await cache.get_json(cache_key)
+        return result, music_client, cached_payload, producer.published
+
+    result, music_client, cached_payload, events = asyncio.run(run())
+
+    assert result["status"] == "generated"
+    assert music_client.last_query
+    assert cached_payload["emotion"] == "Happy"
+    assert [event["event_type"] for event in events] == [
+        "recommendation.requested",
+        "recommendation.served",
+        "recommendation.generated",
+    ]
+    generated = events[-1]
+    assert generated["correlation_id"] == "capture-1"
+    assert generated["payload"]["trigger_event_id"] == "emotion-event-1"
+    assert generated["payload"]["trigger_event_type"] == "emotion.detected"
+    assert generated["payload"]["track_ids"] == ["track-1", "track-2"]
+
+
+def test_emotion_detected_event_skips_same_emotion_during_cooldown():
+    async def run():
+        redis = FakeRedis()
+        cache = RecommendationCache("redis://test", namespace="test")
+        cache._redis = redis
+        producer = FakeEventProducer()
+        music_client = FakeJamendoClient()
+        service = RecommendationService(
+            music_client,
+            _settings(),
+            cache=cache,
+            event_producer=producer,
+        )
+
+        await cache.set_current_emotion("User 1", "Happy", ttl_seconds=60)
+        await cache.set_cooldown("User 1", "Happy", ttl_seconds=60)
+        result = await service.handle_emotion_detected_event(
+            {
+                "event_id": "emotion-event-1",
+                "event_type": "emotion.detected",
+                "user_id": "User 1",
+                "payload": {"emotion": "Happy"},
+            }
+        )
+
+        return result, music_client, producer.published
+
+    result, music_client, events = asyncio.run(run())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "cooldown-active"
+    assert music_client.last_query is None
+    assert events == []
+
+
+def test_recommendation_consumer_dispatches_playback_event_without_republishing():
+    async def run():
+        redis = FakeRedis()
+        cache = RecommendationCache("redis://test", namespace="test")
+        cache._redis = redis
+        producer = FakeEventProducer()
+        service = RecommendationService(
+            FakeJamendoClient(),
+            _settings(),
+            cache=cache,
+            event_producer=producer,
+        )
+        consumer = RecommendationEventConsumer(service, get_event_settings())
+
+        result = await consumer.handle_event(
+            {
+                "event_type": "playback.event",
+                "user_id": "User 1",
+                "payload": {
+                    "event_type": "skipped",
+                    "track_id": "track-123",
+                    "emotion": "Happy",
+                    "provider": "jamendo",
+                },
+            }
+        )
+
+        return result, await cache.get_recent_track_ids("User 1", kind="played"), producer.published
+
+    result, recent_played, events = asyncio.run(run())
+
+    assert result["status"] == "ok"
+    assert recent_played == ["track-123"]
+    assert events == []
 
 
 def test_playback_event_rejects_invalid_event_type():

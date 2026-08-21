@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Aperture,
+  BarChart3,
   Camera,
   CheckCircle2,
   ExternalLink,
@@ -19,13 +20,17 @@ import {
   SkipBack,
   SkipForward,
   Square,
+  TrendingUp,
   Upload,
   User,
   Video,
   X,
 } from "lucide-react";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8001";
+const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL;
+const API_BASE_URL = configuredApiBaseUrl === undefined
+  ? "http://127.0.0.1:8001"
+  : configuredApiBaseUrl.replace(/\/$/, "");
 const MAX_CAPTURE_WIDTH = 960;
 const DEFAULT_RATE_LIMIT_NOTICE_SECONDS = 8;
 const autoCaptureIntervals = [30, 60, 120];
@@ -90,6 +95,39 @@ function formatRetrySeconds(value) {
   return `${minutes} min`;
 }
 
+function formatEventTime(value) {
+  if (!value) {
+    return "--";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function countBy(items, selector) {
+  return items.reduce((counts, item) => {
+    const key = selector(item) || "Unknown";
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function topEntries(counts, limit = 6) {
+  return Object.entries(counts)
+    .sort((first, second) => second[1] - first[1])
+    .slice(0, limit);
+}
+
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -128,6 +166,7 @@ function App() {
   const [showCameraPanel, setShowCameraPanel] = useState(false);
   const [showProfilePanel, setShowProfilePanel] = useState(() => !authToken);
   const [showPreferencesPanel, setShowPreferencesPanel] = useState(false);
+  const [showAnalyticsPanel, setShowAnalyticsPanel] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -137,6 +176,14 @@ function App() {
   const [autoTrackingInterval, setAutoTrackingInterval] = useState(60);
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.6);
   const [refreshOnlyOnMoodChange, setRefreshOnlyOnMoodChange] = useState(true);
+  const [analyticsStatus, setAnalyticsStatus] = useState("idle");
+  const [analyticsError, setAnalyticsError] = useState("");
+  const [analyticsData, setAnalyticsData] = useState({
+    summary: null,
+    moods: [],
+    recommendations: [],
+    playback: [],
+  });
 
   const currentTrack = recommendations[currentTrackIndex] || null;
   const accent = useMemo(
@@ -149,6 +196,14 @@ function App() {
   );
   const selectedLanguageLabel = languageOptions.find((option) => option.value === languagePreference)?.label || "Any language";
   const progressPercent = duration ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+  const moodCounts = useMemo(() => topEntries(countBy(analyticsData.moods, (mood) => mood.emotion)), [analyticsData.moods]);
+  const playbackCounts = useMemo(() => topEntries(countBy(analyticsData.playback, (event) => event.action)), [analyticsData.playback]);
+  const recommendationEmotionCounts = useMemo(
+    () => topEntries(countBy(analyticsData.recommendations, (event) => event.emotion)),
+    [analyticsData.recommendations],
+  );
+  const maxMoodCount = Math.max(1, ...moodCounts.map((entry) => entry[1]));
+  const maxPlaybackCount = Math.max(1, ...playbackCounts.map((entry) => entry[1]));
   const shellStyle = {
     "--accent": accent,
     "--mood-bg": moodBackground[0],
@@ -379,6 +434,12 @@ function App() {
     }
   }, [currentTrack?.audio_url, shouldAutoPlay]);
 
+  useEffect(() => {
+    if (showAnalyticsPanel && authStatus === "signed-in") {
+      loadAnalytics();
+    }
+  }, [showAnalyticsPanel, authStatus]);
+
   async function startCamera() {
     setError("");
 
@@ -434,6 +495,7 @@ function App() {
         setShowQueue(false);
         setShowPreferencesPanel(false);
         setShowProfilePanel(false);
+        setShowAnalyticsPanel(false);
       }
 
       return nextVisible;
@@ -590,6 +652,53 @@ function App() {
     }
 
     return body.emotion || null;
+  }
+
+  async function loadAnalytics() {
+    if (!authToken) {
+      return;
+    }
+
+    setAnalyticsStatus("loading");
+    setAnalyticsError("");
+
+    try {
+      const headers = { Authorization: `Bearer ${authToken}` };
+      const responses = await Promise.all([
+        fetch(`${API_BASE_URL}/api/analytics/me/summary`, { headers }),
+        fetch(`${API_BASE_URL}/api/analytics/me/moods?limit=30`, { headers }),
+        fetch(`${API_BASE_URL}/api/analytics/me/recommendations?limit=30`, { headers }),
+        fetch(`${API_BASE_URL}/api/analytics/me/playback?limit=30`, { headers }),
+      ]);
+      const bodies = await Promise.all(responses.map((response) => response.json().catch(() => ({}))));
+      const failedIndex = responses.findIndex((response) => !response.ok);
+
+      if (failedIndex !== -1) {
+        const failedResponse = responses[failedIndex];
+        const failedBody = bodies[failedIndex];
+
+        if (failedResponse.status === 429) {
+          showRateLimitNotice(failedResponse, failedBody);
+        }
+
+        throw new Error(failedBody.detail || `Analytics failed with ${failedResponse.status}`);
+      }
+
+      setAnalyticsData({
+        summary: bodies[0],
+        moods: bodies[1].moods || [],
+        recommendations: bodies[2].recommendations || [],
+        playback: bodies[3].playback || [],
+      });
+      setAnalyticsStatus("ready");
+    } catch (analyticsLoadError) {
+      if (isFetchFailure(analyticsLoadError)) {
+        showRateLimitFetchFailureNotice();
+      }
+
+      setAnalyticsStatus("error");
+      setAnalyticsError(analyticsLoadError.message);
+    }
   }
 
   function emitPlaybackEvent(eventType, track = currentTrack) {
@@ -793,6 +902,7 @@ function App() {
         setShowCameraPanel(false);
         setShowPreferencesPanel(false);
         setShowProfilePanel(false);
+        setShowAnalyticsPanel(false);
       }
 
       return nextVisible;
@@ -811,6 +921,26 @@ function App() {
         setShowCameraPanel(false);
         setShowQueue(false);
         setShowProfilePanel(false);
+        setShowAnalyticsPanel(false);
+      }
+
+      return nextVisible;
+    });
+  }
+
+  function toggleAnalyticsPanel() {
+    if (authStatus !== "signed-in") {
+      return;
+    }
+
+    setShowAnalyticsPanel((visible) => {
+      const nextVisible = !visible;
+
+      if (nextVisible) {
+        setShowCameraPanel(false);
+        setShowQueue(false);
+        setShowPreferencesPanel(false);
+        setShowProfilePanel(false);
       }
 
       return nextVisible;
@@ -825,6 +955,7 @@ function App() {
         setShowCameraPanel(false);
         setShowQueue(false);
         setShowPreferencesPanel(false);
+        setShowAnalyticsPanel(false);
       }
 
       return nextVisible;
@@ -972,7 +1103,16 @@ function App() {
     setShowCameraPanel(false);
     setShowQueue(false);
     setShowPreferencesPanel(false);
+    setShowAnalyticsPanel(false);
     setShowProfilePanel(true);
+    setAnalyticsStatus("idle");
+    setAnalyticsError("");
+    setAnalyticsData({
+      summary: null,
+      moods: [],
+      recommendations: [],
+      playback: [],
+    });
   }
 
   async function handleUpload(event) {
@@ -1078,6 +1218,9 @@ function App() {
               </button>
               <button className={`nav-button ${showPreferencesPanel ? "active" : ""}`} onClick={togglePreferencesPanel} title="Music preferences" type="button">
                 <Settings2 size={18} />
+              </button>
+              <button className={`nav-button ${showAnalyticsPanel ? "active" : ""}`} onClick={toggleAnalyticsPanel} title="Analytics" type="button">
+                <BarChart3 size={18} />
               </button>
             </>
           )}
@@ -1212,6 +1355,137 @@ function App() {
               <span>Refresh only when mood changes</span>
             </label>
           </div>
+        </section>
+      )}
+
+      {showAnalyticsPanel && (
+        <section className="nav-popover analytics-popover" aria-label="Your analytics">
+          <button className="close-button" onClick={() => setShowAnalyticsPanel(false)} type="button">
+            <X size={18} />
+          </button>
+          <div className="analytics-header">
+            <p className="panel-kicker">Mood Analytics</p>
+            <button className="ghost-command compact-command" onClick={loadAnalytics} disabled={analyticsStatus === "loading"} type="button">
+              {analyticsStatus === "loading" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+              <span>Refresh</span>
+            </button>
+          </div>
+
+          {analyticsStatus === "error" && (
+            <div className="notice compact error">
+              <AlertCircle size={16} />
+              <span>{analyticsError}</span>
+            </div>
+          )}
+
+          {analyticsStatus === "loading" && !analyticsData.summary && (
+            <div className="analytics-empty">
+              <Loader2 className="spin" size={22} />
+              <span>Loading your listening signal</span>
+            </div>
+          )}
+
+          {analyticsStatus !== "loading" && !analyticsData.moods.length && !analyticsData.playback.length && !analyticsData.recommendations.length && (
+            <div className="analytics-empty">
+              <TrendingUp size={24} />
+              <span>No analytics yet. Capture moods and play tracks to build this view.</span>
+            </div>
+          )}
+
+          {(analyticsData.moods.length > 0 || analyticsData.playback.length > 0 || analyticsData.recommendations.length > 0) && (
+            <div className="analytics-grid">
+              <div className="analytics-metric">
+                <span>Moods</span>
+                <strong>{analyticsData.summary?.counts?.moods ?? analyticsData.moods.length}</strong>
+              </div>
+              <div className="analytics-metric">
+                <span>Recommendations</span>
+                <strong>{analyticsData.summary?.counts?.recommendations ?? analyticsData.recommendations.length}</strong>
+              </div>
+              <div className="analytics-metric">
+                <span>Playback</span>
+                <strong>{analyticsData.summary?.counts?.playback ?? analyticsData.playback.length}</strong>
+              </div>
+
+              <div className="analytics-panel mood-bars">
+                <div className="analytics-panel-title">
+                  <span>Mood Mix</span>
+                  <small>{analyticsData.summary?.latest_mood?.emotion || "Recent captures"}</small>
+                </div>
+                <div className="bar-stack">
+                  {moodCounts.map(([emotion, count]) => (
+                    <div className="bar-row" key={emotion}>
+                      <span>{emotion}</span>
+                      <div className="bar-track">
+                        <i style={{ width: `${Math.max(8, (count / maxMoodCount) * 100)}%`, background: emotionTone[emotion] || emotionTone.Neutral }} />
+                      </div>
+                      <b>{count}</b>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="analytics-panel playback-bars">
+                <div className="analytics-panel-title">
+                  <span>Playback Actions</span>
+                  <small>{analyticsData.playback.length ? "Recent events" : "No plays yet"}</small>
+                </div>
+                <svg className="analytics-chart" viewBox="0 0 240 100" role="img" aria-label="Playback action chart">
+                  {playbackCounts.map(([action, count], index) => {
+                    const barHeight = Math.max(8, (count / maxPlaybackCount) * 72);
+                    const x = 20 + index * 52;
+                    const y = 84 - barHeight;
+
+                    return (
+                      <g key={action}>
+                        <rect x={x} y={y} width="30" height={barHeight} rx="5" />
+                        <text x={x + 15} y="98" textAnchor="middle">{action.slice(0, 4)}</text>
+                      </g>
+                    );
+                  })}
+                </svg>
+              </div>
+
+              <div className="analytics-panel analytics-wide">
+                <div className="analytics-panel-title">
+                  <span>Recent Mood Timeline</span>
+                  <small>{analyticsData.moods.length} points</small>
+                </div>
+                <div className="mood-timeline">
+                  {analyticsData.moods.slice(0, 12).map((mood) => (
+                    <span
+                      key={mood.event_id || `${mood.emotion}-${mood.occurred_at}`}
+                      title={`${mood.emotion} at ${formatEventTime(mood.occurred_at)}`}
+                      style={{ background: emotionTone[mood.emotion] || emotionTone.Neutral }}
+                    />
+                  ))}
+                </div>
+                <ul className="analytics-feed">
+                  {analyticsData.moods.slice(0, 4).map((mood) => (
+                    <li key={mood.event_id || `${mood.emotion}-${mood.occurred_at}`}>
+                      <strong>{mood.emotion || "Unknown mood"}</strong>
+                      <span>{formatEventTime(mood.occurred_at)} · {formatPercent(mood.confidence)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="analytics-panel analytics-wide">
+                <div className="analytics-panel-title">
+                  <span>Recommendation Signal</span>
+                  <small>{recommendationEmotionCounts.map(([emotion]) => emotion).join(", ") || "Waiting"}</small>
+                </div>
+                <ul className="analytics-feed">
+                  {analyticsData.recommendations.slice(0, 4).map((item) => (
+                    <li key={item.event_id || `${item.emotion}-${item.occurred_at}`}>
+                      <strong>{item.emotion || "Recommendation"}</strong>
+                      <span>{item.query || item.dynamic_profile?.variant || "No query stored"}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
         </section>
       )}
 

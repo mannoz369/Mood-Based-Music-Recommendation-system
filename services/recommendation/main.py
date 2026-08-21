@@ -4,7 +4,8 @@ from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import get_recommendation_settings
+from config import get_event_settings, get_recommendation_settings
+from services.events import create_event_producer
 from services.recommendation.cache import RecommendationCache
 from services.recommendation.service import RecommendationService
 from services.recommendation.jamendo_client import JamendoClient, JamendoError
@@ -53,6 +54,7 @@ def get_recommendation_service():
             namespace=service_settings.redis_namespace,
             fail_open=service_settings.redis_fail_open,
         ),
+        event_producer=create_event_producer(get_event_settings()),
     )
 
 

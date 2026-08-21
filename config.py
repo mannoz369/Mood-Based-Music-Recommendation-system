@@ -46,6 +46,7 @@ class ApiGatewaySettings:
     emotion_api_base_url: str
     auth_service_base_url: str
     recommendation_service_base_url: str
+    analytics_service_base_url: str
     redis_url: str | None
     redis_namespace: str
     redis_fail_open: bool
@@ -72,6 +73,18 @@ class AuthSettings:
 
 
 @dataclass(frozen=True)
+class AnalyticsSettings:
+    service_name: str
+    mongodb_uri: str | None
+    mongodb_database: str
+    events_collection: str
+    mood_timeline_collection: str
+    recommendation_history_collection: str
+    playback_history_collection: str
+    fail_open: bool
+
+
+@dataclass(frozen=True)
 class RecommendationSettings:
     service_name: str
     jamendo_client_id: str | None
@@ -86,6 +99,16 @@ class RecommendationSettings:
     recent_track_limit: int
     recent_track_ttl_seconds: int
     cors_origins: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class EventSettings:
+    kafka_enabled: bool
+    kafka_bootstrap_servers: str | None
+    kafka_client_id: str
+    kafka_fail_open: bool
+    kafka_consumer_group_id: str = "emotion-music-ai-recommendation"
+    recommendation_precompute_enabled: bool = True
 
 
 def _get_float(name, default):
@@ -152,6 +175,9 @@ def get_api_gateway_settings():
         recommendation_service_base_url=os.getenv(
             "RECOMMENDATION_SERVICE_BASE_URL", "http://127.0.0.1:8004"
         ).rstrip("/"),
+        analytics_service_base_url=os.getenv(
+            "ANALYTICS_SERVICE_BASE_URL", "http://127.0.0.1:8005"
+        ).rstrip("/"),
         redis_url=os.getenv("REDIS_URL") or None,
         redis_namespace=os.getenv("REDIS_NAMESPACE", "emotion-music-ai"),
         redis_fail_open=_get_bool("REDIS_FAIL_OPEN", True),
@@ -185,6 +211,28 @@ def get_auth_settings():
     )
 
 
+def get_analytics_settings():
+    return AnalyticsSettings(
+        service_name=os.getenv("ANALYTICS_SERVICE_NAME", "analytics-service"),
+        mongodb_uri=os.getenv("MONGODB_URI") or None,
+        mongodb_database=os.getenv("MONGODB_DATABASE", "emotion_music_ai"),
+        events_collection=os.getenv("ANALYTICS_EVENTS_COLLECTION", "analytics_events"),
+        mood_timeline_collection=os.getenv(
+            "ANALYTICS_MOOD_TIMELINE_COLLECTION",
+            "user_mood_timeline",
+        ),
+        recommendation_history_collection=os.getenv(
+            "ANALYTICS_RECOMMENDATION_HISTORY_COLLECTION",
+            "user_recommendation_history",
+        ),
+        playback_history_collection=os.getenv(
+            "ANALYTICS_PLAYBACK_HISTORY_COLLECTION",
+            "user_playback_history",
+        ),
+        fail_open=_get_bool("ANALYTICS_FAIL_OPEN", True),
+    )
+
+
 def get_recommendation_settings():
     return RecommendationSettings(
         service_name=os.getenv("RECOMMENDATION_SERVICE_NAME", "recommendation-service"),
@@ -204,5 +252,22 @@ def get_recommendation_settings():
         cors_origins=_get_csv(
             "RECOMMENDATION_SERVICE_CORS_ORIGINS",
             ("http://localhost:5173", "http://127.0.0.1:5173"),
+        ),
+    )
+
+
+def get_event_settings():
+    return EventSettings(
+        kafka_enabled=_get_bool("KAFKA_ENABLED", False),
+        kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS") or None,
+        kafka_client_id=os.getenv("KAFKA_CLIENT_ID", "emotion-music-ai"),
+        kafka_fail_open=_get_bool("KAFKA_FAIL_OPEN", True),
+        kafka_consumer_group_id=os.getenv(
+            "KAFKA_CONSUMER_GROUP_ID",
+            "emotion-music-ai-recommendation",
+        ),
+        recommendation_precompute_enabled=_get_bool(
+            "RECOMMENDATION_PRECOMPUTE_ENABLED",
+            True,
         ),
     )

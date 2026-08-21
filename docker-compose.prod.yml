@@ -1,0 +1,125 @@
+x-backend-build: &backend-build
+  context: .
+  dockerfile: Dockerfile.backend
+
+x-backend-env: &backend-env
+  env_file:
+    - .env
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: emotion-music-ai-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  emotion_api:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-emotion-api
+    command: ["python", "-m", "uvicorn", "services.emotion_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+
+  auth:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-auth
+    command: ["python", "-m", "uvicorn", "services.auth.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    expose:
+      - "8002"
+
+  recommendation:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-recommendation
+    command: ["python", "-m", "uvicorn", "services.recommendation.main:app", "--host", "0.0.0.0", "--port", "8004"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    expose:
+      - "8004"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  analytics:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-analytics
+    command: ["python", "-m", "uvicorn", "services.analytics.main:app", "--host", "0.0.0.0", "--port", "8005"]
+    expose:
+      - "8005"
+
+  api_gateway:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-api-gateway
+    command: ["python", "-m", "uvicorn", "services.api_gateway.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      EMOTION_API_BASE_URL: http://emotion_api:8000
+      AUTH_SERVICE_BASE_URL: http://auth:8002
+      RECOMMENDATION_SERVICE_BASE_URL: http://recommendation:8004
+      ANALYTICS_SERVICE_BASE_URL: http://analytics:8005
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+      emotion_api:
+        condition: service_started
+      auth:
+        condition: service_started
+      recommendation:
+        condition: service_started
+      analytics:
+        condition: service_started
+
+  recommendation_consumer:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-recommendation-consumer
+    command: ["python", "-m", "services.recommendation.consumer"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  analytics_consumer:
+    <<: *backend-env
+    build: *backend-build
+    container_name: emotion-music-ai-analytics-consumer
+    command: ["python", "-m", "services.analytics.consumer"]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ""
+    container_name: emotion-music-ai-frontend
+    ports:
+      - "127.0.0.1:5173:80"
+    restart: unless-stopped
+    depends_on:
+      api_gateway:
+        condition: service_started
+
+volumes:
+  redis-data:

@@ -1,0 +1,37 @@
+services:
+  api_gateway:
+    environment:
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - default
+      - airbnb_kafka
+
+  recommendation:
+    environment:
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - default
+      - airbnb_kafka
+
+  recommendation_consumer:
+    environment:
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - default
+      - airbnb_kafka
+
+  analytics_consumer:
+    environment:
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - default
+      - airbnb_kafka
+
+networks:
+  airbnb_kafka:
+    external: true
+    name: airbnb-replica_default

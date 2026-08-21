@@ -1,6 +1,7 @@
 import hashlib
 from datetime import datetime, timezone
 
+from services.events import EventEnvelope
 from services.recommendation.intents import (
     EMOTION_INTENTS,
     get_intent_for_emotion,
@@ -9,10 +10,11 @@ from services.recommendation.intents import (
 
 
 class RecommendationService:
-    def __init__(self, music_client, settings, cache=None):
+    def __init__(self, music_client, settings, cache=None, event_producer=None):
         self.music_client = music_client
         self.settings = settings
         self.cache = cache
+        self.event_producer = event_producer
 
     def metadata(self):
         return {
@@ -55,6 +57,7 @@ class RecommendationService:
         user_id="anonymous",
         emotion=None,
         provider="jamendo",
+        publish_event=True,
     ):
         if event_type not in {"started", "paused", "skipped", "ended"}:
             raise ValueError(f"Unsupported playback event type: {event_type}")
@@ -71,13 +74,99 @@ class RecommendationService:
                 ttl_seconds=self.settings.recent_track_ttl_seconds,
             )
 
-        return {
+        response = {
             "status": "ok",
             "event_type": event_type,
             "track_id": str(track_id),
             "emotion": emotion,
             "provider": provider or "jamendo",
         }
+        if publish_event:
+            await self._publish_event(
+                "playback.event",
+                user_id,
+                {
+                    "event_type": event_type,
+                    "track_id": str(track_id),
+                    "emotion": emotion,
+                    "provider": provider or "jamendo",
+                },
+            )
+        return response
+
+    async def handle_emotion_detected_event(self, event, precompute=True):
+        payload = event.get("payload") or {}
+        user_id = event.get("user_id") or payload.get("user_id") or "anonymous"
+        emotion = payload.get("emotion")
+
+        if not emotion:
+            return {
+                "status": "skipped",
+                "reason": "emotion is missing.",
+            }
+
+        current_emotion = await self.current_emotion(user_id)
+        cooldown = (
+            await self.cache.get_cooldown(user_id, emotion)
+            if self.cache
+            else {"active": False, "ttl_seconds": None}
+        )
+
+        if current_emotion == emotion and cooldown["active"]:
+            return {
+                "status": "skipped",
+                "reason": "cooldown-active",
+                "emotion": emotion,
+                "user_id": user_id,
+                "cooldown": cooldown,
+            }
+
+        if not precompute:
+            if self.cache:
+                await self.cache.set_current_emotion(
+                    user_id,
+                    emotion,
+                    ttl_seconds=self.settings.cooldown_seconds,
+                )
+                await self.cache.set_cooldown(
+                    user_id,
+                    emotion,
+                    ttl_seconds=self.settings.cooldown_seconds,
+                )
+
+            return {
+                "status": "updated",
+                "emotion": emotion,
+                "user_id": user_id,
+                "precomputed": False,
+            }
+
+        response = await self.from_emotion(
+            emotion,
+            limit=payload.get("limit"),
+            user_id=user_id,
+            language=payload.get("language"),
+            request_seed=event.get("event_id") or event.get("correlation_id"),
+        )
+        await self._publish_recommendation_generated(user_id, response, event)
+        return {
+            "status": "generated",
+            "emotion": emotion,
+            "user_id": user_id,
+            "cache": response.get("cache"),
+            "track_count": len(response.get("tracks", [])),
+        }
+
+    async def handle_playback_event(self, event):
+        payload = event.get("payload") or {}
+        return await self.record_playback_event(
+            payload.get("event_type"),
+            payload.get("track_id"),
+            user_id=event.get("user_id") or payload.get("user_id") or "anonymous",
+            emotion=payload.get("emotion"),
+            provider=payload.get("provider") or "jamendo",
+            publish_event=False,
+        )
 
     async def from_emotion(
         self,
@@ -92,6 +181,18 @@ class RecommendationService:
         resolved_language = self._normalize_language(language)
         recent_recommended_ids = await self._recent_track_ids(user_id, kind="recommended")
         recent_played_ids = await self._recent_track_ids(user_id, kind="played")
+        await self._publish_event(
+            "recommendation.requested",
+            user_id,
+            {
+                "emotion": emotion,
+                "limit": resolved_limit,
+                "language": resolved_language or "any",
+                "request_seed": request_seed,
+                "recent_recommended_track_count": len(recent_recommended_ids),
+                "recent_played_track_count": len(recent_played_ids),
+            },
+        )
         query_contexts = self._dynamic_query_contexts(
             emotion,
             intent,
@@ -125,6 +226,7 @@ class RecommendationService:
                     user_id,
                     cached_response.get("tracks", []),
                 )
+                await self._publish_recommendation_served(user_id, cached_response)
                 return cached_response
 
             tracks = await self.music_client.search_tracks(
@@ -157,13 +259,84 @@ class RecommendationService:
             if ranked_tracks:
                 await self._write_cache(cache_key, response, user_id, emotion)
                 await self._remember_recommended_tracks(user_id, ranked_tracks)
+                await self._publish_recommendation_served(user_id, response)
                 return response
 
             empty_response = (cache_key, response)
 
         cache_key, response = empty_response
         await self._write_cache(cache_key, response, user_id, emotion)
+        await self._publish_recommendation_served(user_id, response)
         return response
+
+    async def _publish_event(self, event_type, user_id, payload, correlation_id=None):
+        if not self.event_producer:
+            return
+
+        try:
+            await self.event_producer.publish(
+                EventEnvelope(
+                    event_type=event_type,
+                    source_service=self.settings.service_name,
+                    user_id=user_id,
+                    correlation_id=correlation_id,
+                    payload=payload,
+                )
+            )
+        except Exception:
+            producer_settings = getattr(self.event_producer, "settings", None)
+
+            if not getattr(producer_settings, "kafka_fail_open", True):
+                raise
+
+    async def _publish_recommendation_served(self, user_id, response):
+        await self._publish_event(
+            "recommendation.served",
+            user_id,
+            {
+                "emotion": response.get("emotion"),
+                "provider": response.get("provider"),
+                "language": response.get("language"),
+                "query": response.get("query"),
+                "query_seed": response.get("query_seed"),
+                "dynamic_profile": response.get("dynamic_profile"),
+                "track_ids": [
+                    str(track_id)
+                    for track_id in (
+                        track.get("id") or track.get("uri")
+                        for track in response.get("tracks", [])
+                    )
+                    if track_id
+                ],
+                "cache": response.get("cache"),
+            },
+        )
+
+    async def _publish_recommendation_generated(self, user_id, response, trigger_event):
+        await self._publish_event(
+            "recommendation.generated",
+            user_id,
+            {
+                "emotion": response.get("emotion"),
+                "provider": response.get("provider"),
+                "language": response.get("language"),
+                "query": response.get("query"),
+                "query_seed": response.get("query_seed"),
+                "dynamic_profile": response.get("dynamic_profile"),
+                "track_ids": [
+                    str(track_id)
+                    for track_id in (
+                        track.get("id") or track.get("uri")
+                        for track in response.get("tracks", [])
+                    )
+                    if track_id
+                ],
+                "cache": response.get("cache"),
+                "trigger_event_id": trigger_event.get("event_id"),
+                "trigger_event_type": trigger_event.get("event_type"),
+            },
+            correlation_id=trigger_event.get("correlation_id"),
+        )
 
     def _dynamic_query_contexts(
         self,

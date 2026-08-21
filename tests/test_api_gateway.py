@@ -54,11 +54,27 @@ class FakeRateLimitCache:
         return f"rate-limit:{scope}:{identifier}"
 
 
+class FakeEventProducer:
+    def __init__(self):
+        self.published = []
+
+    async def publish(self, event, topic=None):
+        self.published.append(event.to_dict())
+        return {"event": event.to_dict(), "topic": topic, "published": True}
+
+
 @pytest.fixture(autouse=True)
 def passthrough_rate_limiter(monkeypatch):
     cache = FakeRateLimitCache()
     monkeypatch.setattr(main, "get_rate_limit_cache", lambda: cache)
     return cache
+
+
+@pytest.fixture(autouse=True)
+def passthrough_event_producer(monkeypatch):
+    producer = FakeEventProducer()
+    monkeypatch.setattr(main, "get_event_producer", lambda: producer)
+    return producer
 
 
 def test_gateway_health_reports_emotion_service(monkeypatch):
@@ -252,6 +268,47 @@ def test_gateway_injects_user_id_for_current_emotion_lookup(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"emotion": "Happy"}
+
+
+def test_gateway_forwards_analytics_request_with_trusted_user_id(monkeypatch):
+    async def fake_request_downstream(method, url, headers=None, content=None):
+        if url.endswith("/auth/me"):
+            return _auth_me_response()
+
+        assert method == "GET"
+        assert url.endswith("/analytics/me/moods?user_id=spoofed-user")
+        assert headers["x-user-id"] == "auth-user"
+        return _json_response(
+            200,
+            {
+                "user_id": "auth-user",
+                "moods": [{"emotion": "Happy"}],
+            },
+        )
+
+    monkeypatch.setattr(main, "request_downstream", fake_request_downstream)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/api/analytics/me/moods?user_id=spoofed-user",
+        headers=AUTH_HEADER,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user_id"] == "auth-user"
+
+
+def test_gateway_rejects_analytics_without_bearer_token(monkeypatch):
+    async def fake_request_downstream(method, url, headers=None, content=None):
+        raise AssertionError("Unauthenticated analytics should not be proxied.")
+
+    monkeypatch.setattr(main, "request_downstream", fake_request_downstream)
+    client = TestClient(main.app)
+
+    response = client.get("/api/analytics/me/summary")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing bearer token."
 
 
 def test_gateway_forwards_playback_event_with_trusted_user_id(monkeypatch):
@@ -466,6 +523,49 @@ def test_gateway_forwards_emotion_detection_upload(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["emotion"] == "Happy"
+
+
+def test_gateway_publishes_camera_and_emotion_events(monkeypatch, passthrough_event_producer):
+    async def fake_request_downstream(method, url, headers=None, content=None):
+        if url.endswith("/auth/me"):
+            return _auth_me_response()
+
+        assert method == "POST"
+        assert url.endswith("/emotion/detect")
+        return _json_response(
+            200,
+            {
+                "emotion": "Happy",
+                "confidence": 0.87,
+                "face": {"x": 1, "y": 2, "width": 3, "height": 4},
+            },
+        )
+
+    monkeypatch.setattr(main, "request_downstream", fake_request_downstream)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/emotion/detect",
+        files={"file": ("face.jpg", b"fake image", "image/jpeg")},
+        headers={**AUTH_HEADER, "X-Correlation-Id": "capture-1"},
+    )
+
+    assert response.status_code == 200
+    assert [event["event_type"] for event in passthrough_event_producer.published] == [
+        "camera.capture",
+        "emotion.detected",
+    ]
+    camera_payload = passthrough_event_producer.published[0]["payload"]
+    emotion_payload = passthrough_event_producer.published[1]["payload"]
+    assert camera_payload["route"] == "/api/emotion/detect"
+    assert "fake image" not in str(camera_payload)
+    assert emotion_payload == {
+        "emotion": "Happy",
+        "confidence": 0.87,
+        "face": {"x": 1, "y": 2, "width": 3, "height": 4},
+    }
+    assert passthrough_event_producer.published[0]["user_id"] == "auth-user"
+    assert passthrough_event_producer.published[0]["correlation_id"] == "capture-1"
 
 
 def test_gateway_preserves_emotion_error_response(monkeypatch):

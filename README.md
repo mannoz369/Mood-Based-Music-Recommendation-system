@@ -7,7 +7,7 @@ This is the first stabilized core for the larger music recommendation platform d
 ## Requirements
 
 - Python 3.12
-- Docker Desktop, for local Redis
+- Docker Desktop, for local Redis and Kafka
 - A working webcam for the live app
 - The emotion model at `models/fer2013_mini_XCEPTION.102-0.66.hdf5`
 
@@ -20,12 +20,13 @@ python -m venv .venv
 
 On macOS or Linux, use `.venv/bin/python` instead of `.\.venv\Scripts\python.exe`.
 
-## Local Redis
+## Local Infrastructure
 
-Redis is used for recommendation cache state, cooldowns, rate-limit counters, current mood, and recent track memory. Run Redis through Docker Compose instead of installing it directly on your machine:
+Redis is used for recommendation cache state, cooldowns, rate-limit counters, current mood, and recent track memory. Kafka is used for asynchronous emotion, recommendation, and playback events. Run both through Docker Compose instead of installing them directly on your machine:
 
 ```powershell
-docker compose up -d redis redisinsight
+docker compose up -d redis
+docker compose --profile local-mongo --profile local-kafka --profile tools up -d mongodb redpanda redisinsight kafka-ui
 ```
 
 Verify Redis is ready:
@@ -36,6 +37,15 @@ docker compose exec redis redis-cli ping
 ```
 
 Expected result: `redis-cli ping` returns `PONG`.
+
+Verify Kafka is ready:
+
+```powershell
+docker compose ps redpanda
+docker compose exec redpanda rpk topic list
+```
+
+Expected result: the topic list command exits successfully. It may print no topics until the app publishes its first event.
 
 Open RedisInsight at:
 
@@ -50,15 +60,19 @@ When adding the database in RedisInsight, use:
 - Username: leave blank
 - Password: leave blank
 
-The default local `.env` value should point at the Dockerized Redis instance:
+The default local `.env` values should point at Dockerized Redis and Kafka:
 
 ```env
 REDIS_URL=redis://127.0.0.1:6379/0
 REDIS_NAMESPACE=emotion-music-ai
 REDIS_FAIL_OPEN=true
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 ```
 
-With `REDIS_FAIL_OPEN=true`, backend services can still start while Redis is stopped, but Redis-backed cache, cooldown, and rate-limit behavior will be degraded.
+With `REDIS_FAIL_OPEN=true` and `KAFKA_FAIL_OPEN=true`, backend services can still start while Redis or Kafka is stopped, but Redis-backed behavior and async event behavior will be degraded.
+
+All local infrastructure ports are bound to `127.0.0.1` in Compose so Redis, MongoDB, RedisInsight, and Redpanda are not exposed publicly by accident.
 
 ## Run The App
 
@@ -266,10 +280,10 @@ Start the recommendation service:
 .\.venv\Scripts\python.exe -m uvicorn services.recommendation.main:app --host 127.0.0.1 --port 8004 --reload
 ```
 
-For Redis-backed recommendation state, start Dockerized Redis before the recommendation service:
+For Redis-backed recommendation state and Kafka eventing, start Dockerized Redis and Kafka before the recommendation service:
 
 ```powershell
-docker compose up -d redis
+docker compose up -d redis kafka
 ```
 
 Recommendation endpoints do not require OAuth, Premium, or an external user account connection:
@@ -323,6 +337,83 @@ recent-played-tracks:{user_id}
 
 The frontend sends these events best-effort when audio starts, pauses, skips, or ends. Future Kafka work will publish the same events asynchronously.
 
+## Event Module
+
+Phase 2 starts with a shared event package in `services/events/`. It defines versioned event envelopes, topic names, a no-op local producer, and a Kafka producer that is optional for synchronous API responses.
+
+Initial event topics:
+
+```text
+camera.capture.v1
+emotion.detected.v1
+recommendation.requested.v1
+recommendation.generated.v1
+recommendation.served.v1
+playback.event.v1
+```
+
+Kafka is disabled by default for local development:
+
+```env
+KAFKA_ENABLED=false
+KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
+KAFKA_CLIENT_ID=emotion-music-ai
+KAFKA_FAIL_OPEN=true
+```
+
+When `KAFKA_ENABLED=false`, services can use the no-op producer and keep the user-facing API path synchronous. When Kafka is enabled but publishing fails and `KAFKA_FAIL_OPEN=true`, publish failures are reported by the producer without breaking the immediate API flow.
+
+Start local Dockerized Redpanda/Kafka with:
+
+```powershell
+docker compose --profile local-kafka up -d redpanda
+```
+
+List Kafka topics with:
+
+```powershell
+docker compose exec redpanda rpk topic list
+```
+
+The user-facing services publish these Phase 2 events:
+
+- `camera.capture.v1`: API gateway receives `POST /api/emotion/detect`. The payload contains capture metadata only, not image bytes.
+- `emotion.detected.v1`: API gateway receives a successful emotion detection response.
+- `recommendation.requested.v1`: recommendation service starts a mood-to-track request.
+- `recommendation.served.v1`: recommendation service returns cached or freshly fetched tracks.
+- `playback.event.v1`: recommendation service records playback start, pause, skip, or end.
+
+The recommendation service can also consume Kafka events to warm Redis:
+
+```powershell
+.\.venv\Scripts\python.exe -m services.recommendation.consumer
+```
+
+It consumes `emotion.detected.v1` and `playback.event.v1`. On `emotion.detected.v1`, it checks current mood and same-emotion cooldown in Redis, precomputes recommendations when `RECOMMENDATION_PRECOMPUTE_ENABLED=true`, stores the generated recommendation payload in the normal recommendation cache, and publishes `recommendation.generated.v1`. On `playback.event.v1`, it updates `recent-played-tracks:{user_id}` without republishing the same playback event.
+
+The analytics service can consume all app Kafka events and store raw plus derived records in MongoDB. It uses the same `MONGODB_URI` and `MONGODB_DATABASE` settings as the auth service:
+
+```powershell
+.\.venv\Scripts\python.exe -m services.analytics.consumer
+```
+
+It subscribes to `camera.capture.v1`, `emotion.detected.v1`, `recommendation.requested.v1`, `recommendation.generated.v1`, `recommendation.served.v1`, and `playback.event.v1`. It writes every event to `analytics_events`, mood events to `user_mood_timeline`, recommendation events to `user_recommendation_history`, and playback events to `user_playback_history`.
+
+Start the analytics read API on port `8005`:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn services.analytics.main:app --host 127.0.0.1 --port 8005 --reload
+```
+
+Authenticated users can read their own analytics through the gateway:
+
+```text
+GET /api/analytics/me/moods
+GET /api/analytics/me/recommendations
+GET /api/analytics/me/playback
+GET /api/analytics/me/summary
+```
+
 Redis-related recommendation environment variables:
 
 - `REDIS_URL`: Redis connection URL. Defaults locally to `redis://127.0.0.1:6379/0`.
@@ -332,6 +423,99 @@ Redis-related recommendation environment variables:
 - `RECOMMENDATION_COOLDOWN_SECONDS`: current mood and emotion cooldown TTL. Defaults to `60`.
 - `RECOMMENDATION_RECENT_TRACK_LIMIT`: max recent track IDs to keep per list. Defaults to `50`.
 - `RECOMMENDATION_RECENT_TRACK_TTL_SECONDS`: recent track list TTL. Defaults to `86400`.
+
+## EC2 Deployment Beside Airbnb-Replica
+
+The `Airbnb-Replica` EC2 deployment already runs Redpanda/Kafka on its Docker network as service name `kafka` with broker address `kafka:29092`. Use that broker instead of starting another Kafka container for this app.
+
+Production-style Compose files:
+
+```text
+docker-compose.prod.yml
+docker-compose.ec2.yml
+```
+
+`docker-compose.prod.yml` runs this app's containers and only binds the API Gateway and frontend to `127.0.0.1` for host Nginx. Internal services use `expose`, not public `ports`.
+
+`docker-compose.ec2.yml` joins the existing `airbnb-replica_default` Docker network and sets:
+
+```env
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+```
+
+Prepare `.env` on EC2:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Required production values:
+
+```env
+MONGODB_URI=<your MongoDB Atlas URI>
+MONGODB_DATABASE=emotion_music_ai
+JWT_SECRET=<long random secret>
+JAMENDO_CLIENT_ID=<your Jamendo client id>
+REDIS_URL=redis://redis:6379/0
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+API_GATEWAY_ALLOW_ANONYMOUS_APP_ROUTES=false
+```
+
+Build and start on the same EC2 instance:
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml up --build -d
+```
+
+Install the Nginx reverse proxy route:
+
+```bash
+sudo cp deploy/nginx/emotion-music-ai.conf /etc/nginx/sites-available/emotion-music-ai.conf
+sudo ln -sf /etc/nginx/sites-available/emotion-music-ai.conf /etc/nginx/sites-enabled/emotion-music-ai.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Public traffic should reach Nginx on `80` or `443`. Nginx proxies `/api/*` to `127.0.0.1:8001` and the React app to `127.0.0.1:5173`.
+
+Verify on EC2:
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml ps
+curl http://127.0.0.1:8001/api/health
+curl http://127.0.0.1:5173
+docker exec airbnb-replica-kafka rpk topic list
+```
+
+Verify from your laptop:
+
+```bash
+curl http://<ec2-public-ip>/api/health
+```
+
+These direct ports should fail from outside the EC2 security group:
+
+```text
+8000 emotion api
+8002 auth service
+8004 recommendation service
+8005 analytics service
+6379 redis
+5540 redisinsight
+9092 kafka/redpanda
+27017 mongodb
+```
+
+AWS security group should allow only SSH from your IP and public HTTP/HTTPS:
+
+```text
+22 from your IP
+80 from 0.0.0.0/0
+443 from 0.0.0.0/0
+```
 
 ## Tests
 
