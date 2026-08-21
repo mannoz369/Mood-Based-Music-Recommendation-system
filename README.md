@@ -470,6 +470,15 @@ Build and start on the same EC2 instance:
 docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml up --build -d
 ```
 
+If the first build fails with `no space left on device`, clean the failed Docker build cache and retry. The production Compose uses a slim shared backend image for non-ML services and a separate full image only for `emotion_api`, but failed partial layers can still occupy disk:
+
+```bash
+docker builder prune -af
+docker image prune -af
+docker system df
+docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml up --build -d
+```
+
 Install the Nginx reverse proxy route:
 
 ```bash
