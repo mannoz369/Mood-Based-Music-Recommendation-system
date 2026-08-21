@@ -470,6 +470,17 @@ Build and start on the same EC2 instance:
 docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml up --build -d
 ```
 
+If you are not using Nginx, expose the frontend and gateway directly instead:
+
+```env
+VITE_API_BASE_URL=http://<ec2-public-ip>:8001
+API_GATEWAY_CORS_ORIGINS=http://<ec2-public-ip>:5173
+```
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml -f docker-compose.public.yml up --build -d
+```
+
 If the first build fails with `no space left on device`, clean the failed Docker build cache and retry. The production Compose uses a slim shared backend image for non-ML services and a separate full image only for `emotion_api`, but failed partial layers can still occupy disk:
 
 ```bash
@@ -490,6 +501,8 @@ sudo systemctl reload nginx
 
 Public traffic should reach Nginx on `80` or `443`. Nginx proxies `/api/*` to `127.0.0.1:8001` and the React app to `127.0.0.1:5173`.
 
+Without Nginx, public traffic reaches the app directly on `5173` for the frontend and `8001` for the API gateway.
+
 Verify on EC2:
 
 ```bash
@@ -503,6 +516,12 @@ Verify from your laptop:
 
 ```bash
 curl http://<ec2-public-ip>/api/health
+```
+
+Without Nginx:
+
+```bash
+curl http://<ec2-public-ip>:8001/api/health
 ```
 
 These direct ports should fail from outside the EC2 security group:
