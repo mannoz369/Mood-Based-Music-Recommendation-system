@@ -234,18 +234,6 @@ function App() {
     });
   }
 
-  function showRateLimitFetchFailureNotice() {
-    setRateLimitNotice({
-      id: Date.now(),
-      durationMs: DEFAULT_RATE_LIMIT_NOTICE_SECONDS * 1000,
-      message: "You are making too many requests. Try again after a moment.",
-    });
-  }
-
-  function isFetchFailure(error) {
-    return error instanceof TypeError && /failed to fetch/i.test(error.message);
-  }
-
   function dismissRateLimitNotice() {
     setRateLimitNotice(null);
   }
@@ -597,10 +585,6 @@ function App() {
         return;
       }
 
-      if (isFetchFailure(recommendationLoadError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setRecommendations([]);
       setCurrentTrackIndex(0);
       setShouldAutoPlay(false);
@@ -692,10 +676,6 @@ function App() {
       });
       setAnalyticsStatus("ready");
     } catch (analyticsLoadError) {
-      if (isFetchFailure(analyticsLoadError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setAnalyticsStatus("error");
       setAnalyticsError(analyticsLoadError.message);
     }
@@ -849,10 +829,6 @@ function App() {
 
       setPlayerMessage("No cached mood found. Start the camera to refresh songs.");
     } catch (refillError) {
-      if (isFetchFailure(refillError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setPlayerMessage(refillError.message);
     } finally {
       queueRefillInFlightRef.current = false;
@@ -1026,10 +1002,6 @@ function App() {
 
       loadRecommendations(detection.emotion);
     } catch (detectError) {
-      if (isFetchFailure(detectError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setError(detectError.message);
     } finally {
       setIsDetecting(false);
@@ -1070,10 +1042,6 @@ function App() {
       setAuthMessage(authMode === "signup" ? "Account created." : "Signed in.");
       setShowProfilePanel(false);
     } catch (authError) {
-      if (isFetchFailure(authError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setAuthStatus("signed-out");
       setAuthMessage(authError.message);
     }
@@ -1156,10 +1124,6 @@ function App() {
       setIsDetecting(false);
       loadRecommendations(detection.emotion);
     } catch (uploadError) {
-      if (isFetchFailure(uploadError)) {
-        showRateLimitFetchFailureNotice();
-      }
-
       setError(uploadError.message);
     } finally {
       setIsDetecting(false);
