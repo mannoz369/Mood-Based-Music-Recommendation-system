@@ -473,6 +473,7 @@ docker compose -f docker-compose.prod.yml -f docker-compose.ec2.yml up --build -
 If you are not using Nginx, expose the frontend and gateway directly instead:
 
 ```env
+PUBLIC_BIND_HOST=0.0.0.0
 VITE_API_BASE_URL=http://<ec2-public-ip>:8001
 API_GATEWAY_CORS_ORIGINS=http://<ec2-public-ip>:5173
 ```
