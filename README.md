@@ -1,8 +1,24 @@
 # Emotion Music AI
 
-Emotion Music AI currently runs a local webcam emotion detector. It opens a camera with OpenCV, detects the primary face, preprocesses that face into the FER2013 model input format, predicts an emotion with the bundled mini-XCEPTION model, and overlays the emotion plus confidence on the video frame.
+Emotion Music AI has grown from a local webcam emotion detector into a working emotion-aware music recommendation platform. It can detect a user's mood from camera captures, authenticate users, request Jamendo-backed recommendations, remember playback state in Redis, publish event streams through Kafka/Redpanda, store analytics in MongoDB, and run behind a production-style gateway and HTTPS reverse proxy.
 
-This is the first stabilized core for the larger music recommendation platform described in `music-recommendation-platform-spec.md`.
+The original OpenCV app is still available for direct local webcam testing. It opens a camera, detects the primary face, preprocesses that face into the FER2013 model input format, predicts an emotion with the bundled mini-XCEPTION model, and overlays the emotion plus confidence on the video frame.
+
+This repository now implements the main platform path described in `music-recommendation-platform-spec.md`.
+
+## What We Have Achieved
+
+- Stabilized the core emotion detection pipeline with reusable preprocessing, labels, detector wrappers, and a startup smoke check.
+- Added a FastAPI emotion API and a React camera frontend that capture frames, detect mood, and refresh songs automatically.
+- Added a frontend-facing API gateway with auth enforcement, trusted user ID forwarding, Redis-backed rate limiting, downstream health checks, and Kafka event publication for capture and emotion events.
+- Added email/password authentication backed by MongoDB with salted PBKDF2 password hashes and bearer tokens.
+- Added a Jamendo recommendation service that maps FER2013 emotions to music intents, supports language preferences, rotates dynamic query profiles, caches results, tracks current mood, and remembers recently played tracks in Redis.
+- Added playback event recording so starts, pauses, skips, and endings update recent-track memory and analytics.
+- Added a shared event module plus Kafka/Redpanda producers and consumers so recommendation precompute and analytics writes can happen outside the immediate request path.
+- Added an analytics service that stores raw events, mood timeline entries, recommendation history, playback history, and authenticated user summary views in MongoDB.
+- Added Docker Compose infrastructure for local Redis, MongoDB, Redpanda/Kafka, RedisInsight, and Kafka UI.
+- Added production-style Compose files for EC2 deployment, including split lightweight/full backend images, optional direct public binding, and a Caddy HTTPS override for browser camera access.
+- Added tests across detector, API, auth, gateway, recommendation, events, analytics, Redis behavior, Kafka consumer behavior, and operational metrics.
 
 ## Requirements
 
@@ -59,6 +75,12 @@ When adding the database in RedisInsight, use:
 - Port: `6379`
 - Username: leave blank
 - Password: leave blank
+
+Open Kafka UI at:
+
+```text
+http://127.0.0.1:8086
+```
 
 The default local `.env` values should point at Dockerized Redis and Kafka:
 
@@ -180,6 +202,10 @@ The Preferences panel includes auto mood tracking controls:
 
 When auto tracking is enabled, the app avoids overlapping detection requests. Stopping the camera or logging out stops the interval. Low-confidence captures update the visible mood result but do not refresh the queue, and same-mood captures keep the current playback when mood-change-only refresh is enabled.
 
+The frontend also includes an analytics popover for signed-in users. It reads mood, recommendation, playback, and summary data through the gateway and renders recent mood counts, playback action counts, mood timeline points, and recommendation history.
+
+Browser camera access works on `localhost` during development. Public deployments must use HTTPS; if the app is opened over public plain HTTP, the frontend shows a camera access message instead of attempting `getUserMedia`.
+
 Frontend environment variable:
 
 - `VITE_API_BASE_URL`: API gateway base URL. Defaults to `http://127.0.0.1:8001`.
@@ -203,7 +229,24 @@ Gateway endpoints:
 - `POST /api/auth/login`: forwarded to the auth service login route.
 - `GET /api/auth/me`: forwarded to the protected auth service profile route.
 - `GET /api/recommendation/intents`: documented emotion-to-music intents.
+- `GET /api/recommendation/current-emotion`: returns the trusted user's cached current mood.
 - `POST /api/recommendation/from-emotion`: returns Jamendo tracks for an emotion.
+- `POST /api/playback/event`: records trusted-user playback events.
+- `GET /api/analytics/me/moods`: returns trusted-user mood history.
+- `GET /api/analytics/me/recommendations`: returns trusted-user recommendation history.
+- `GET /api/analytics/me/playback`: returns trusted-user playback history.
+- `GET /api/analytics/me/summary`: returns trusted-user analytics summary.
+
+Most app routes require `Authorization: Bearer <token>` by default. The gateway verifies that token with the auth service, then injects the trusted user ID before forwarding recommendation, playback, emotion, and analytics requests. Set `API_GATEWAY_ALLOW_ANONYMOUS_APP_ROUTES=true` only for local demos where anonymous app access is intentional.
+
+The gateway applies Redis-backed rate limits and exposes browser-readable rate-limit headers:
+
+```text
+X-RateLimit-Limit
+X-RateLimit-Remaining
+X-RateLimit-Reset
+Retry-After
+```
 
 Gateway environment variables:
 
@@ -211,7 +254,14 @@ Gateway environment variables:
 - `EMOTION_API_BASE_URL`: downstream emotion API base URL. Defaults to `http://127.0.0.1:8000`.
 - `AUTH_SERVICE_BASE_URL`: downstream auth service base URL. Defaults to `http://127.0.0.1:8002`.
 - `RECOMMENDATION_SERVICE_BASE_URL`: downstream recommendation service base URL. Defaults to `http://127.0.0.1:8004`.
+- `ANALYTICS_SERVICE_BASE_URL`: downstream analytics service base URL. Defaults to `http://127.0.0.1:8005`.
 - `API_GATEWAY_REQUEST_TIMEOUT_SECONDS`: downstream request timeout. Defaults to `60`.
+- `API_GATEWAY_RATE_LIMIT_WINDOW_SECONDS`: Redis-backed rate-limit window. Defaults to `60`.
+- `API_GATEWAY_AUTH_LOGIN_RATE_LIMIT`: login attempts per window. Defaults to `5`.
+- `API_GATEWAY_EMOTION_DETECT_RATE_LIMIT`: emotion detection requests per window. Defaults to `10`.
+- `API_GATEWAY_RECOMMENDATION_RATE_LIMIT`: recommendation requests per window. Defaults to `20`.
+- `API_GATEWAY_FALLBACK_RATE_LIMIT`: fallback per-route requests per window. Defaults to `120`.
+- `API_GATEWAY_ALLOW_ANONYMOUS_APP_ROUTES`: allow anonymous user fallback for app routes. Defaults to `false`.
 - `API_GATEWAY_CORS_ORIGINS`: comma-separated browser origins allowed to call the gateway. Defaults to `http://localhost:5173,http://127.0.0.1:5173`.
 
 ## Auth Service
@@ -335,7 +385,7 @@ Allowed `event_type` values are `started`, `paused`, `skipped`, and `ended`. Pha
 recent-played-tracks:{user_id}
 ```
 
-The frontend sends these events best-effort when audio starts, pauses, skips, or ends. Future Kafka work will publish the same events asynchronously.
+The frontend sends these events best-effort when audio starts, pauses, skips, or ends. The recommendation service records the event in Redis-backed recent-track memory and publishes `playback.event.v1` when Kafka eventing is enabled.
 
 ## Event Module
 
@@ -435,7 +485,12 @@ docker-compose.prod.yml
 docker-compose.ec2.yml
 ```
 
-`docker-compose.prod.yml` runs this app's containers and only binds the API Gateway and frontend to `127.0.0.1` for host Nginx. Internal services use `expose`, not public `ports`.
+`docker-compose.prod.yml` runs this app's containers and only binds the API Gateway and frontend to `127.0.0.1` for host Nginx by default. Internal services use `expose`, not public `ports`.
+
+The production backend build is split into two dependency profiles:
+
+- `emotion_api` uses `requirements.txt` because it needs the full TensorFlow/OpenCV emotion detection stack.
+- Auth, recommendation, analytics, gateway, and consumers share `requirements.web.txt`, a smaller web-service dependency set that reduces image size and disk pressure on EC2.
 
 `docker-compose.ec2.yml` joins the existing `airbnb-replica_default` Docker network and sets:
 
@@ -585,3 +640,14 @@ The tests cover:
 - Empty face crop handling.
 - Emotion detector prediction behavior with a fake model.
 - Practical detector/app import behavior without opening the webcam.
+- Emotion API success and error behavior.
+- Gateway proxying, trusted user forwarding, rate limiting, rate-limit headers, fail-open behavior, health degradation, Kafka event publication, playback routes, and analytics routes.
+- Auth signup, login, password hashing, token handling, and protected profile behavior.
+- Recommendation intents, Jamendo mapping, dynamic query generation, Redis caching, cooldowns, recent-track memory, playback events, current mood, and Kafka consumer precompute behavior.
+- Event envelope shape, topic mapping, no-op producer behavior, and Kafka producer behavior.
+- Analytics event storage, per-user mood/recommendation/playback read APIs, summaries, and analytics Kafka consumer dispatch.
+
+Operational metric tests also document the impact of Redis and Kafka:
+
+- Redis cooldown reduces five repeated same-emotion precompute events from five Jamendo calls to one Jamendo call, an `80%` reduction in that scenario.
+- Kafka removes recommendation and analytics downstream handlers from the immediate request path in the tested event replay model, while consumers still process the replayed events and store analytics records.
