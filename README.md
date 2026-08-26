@@ -5,6 +5,7 @@ Emotion Music AI has grown from a local webcam emotion detector into a working e
 The original OpenCV app is still available for direct local webcam testing. It opens a camera, detects the primary face, preprocesses that face into the FER2013 model input format, predicts an emotion with the bundled mini-XCEPTION model, and overlays the emotion plus confidence on the video frame.
 
 This repository now implements the main platform path described in `music-recommendation-platform-spec.md`.
+
 live - https://13-53-140-232.sslip.io/
 
 ## What We Have Achieved
